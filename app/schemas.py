@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 MIN_DIM = 2
 MAX_DIM = 20
@@ -79,6 +79,32 @@ class PathCell(BaseModel):
     layer: int
 
 
+class InspectCell(BaseModel):
+    """A path step submitted to /inspect.
+
+    Coordinates must be integers but are *not* range-checked here:
+    out-of-board steps or illegal layer numbers are reported as routing
+    violations (HTTP 200), whereas non-integer input is a malformed
+    request (HTTP 422). Numeric strings and booleans are rejected, while
+    integral floats (``1.0``) are normalised to ``int``.
+    """
+
+    x: int
+    y: int
+    layer: int
+
+    @field_validator("x", "y", "layer", mode="before")
+    @classmethod
+    def _must_be_integral_number(cls, v):
+        if isinstance(v, bool) or isinstance(v, str):
+            raise ValueError("coordinate must be an integer")
+        if isinstance(v, float):
+            if not v.is_integer():
+                raise ValueError("coordinate must be an integer")
+            return int(v)
+        return v
+
+
 class ViaPoint(BaseModel):
     x: int
     y: int
@@ -102,3 +128,50 @@ class RouteResponse(BaseModel):
     total_vias: Optional[int] = None
     total_moves: Optional[int] = None
     nets: Optional[list[NetResult]] = None
+
+
+class InspectRequest(RouteRequest):
+    """Board + net definition (same fields as /route) plus one ordered
+    candidate path per net, in net order. /inspect never re-solves: it only
+    reports every rule the given paths violate."""
+
+    paths: list[list[InspectCell]]
+
+    @model_validator(mode="after")
+    def _check_paths(self) -> "InspectRequest":
+        if len(self.paths) != len(self.nets):
+            raise ValueError(
+                f"number of paths ({len(self.paths)}) must match number of "
+                f"nets ({len(self.nets)})"
+            )
+        # a simple path can occupy at most one cell per (x, y, layer); an
+        # over-long path is malformed input rather than a routing violation
+        max_cells = self.width * self.height * len(LAYERS)
+        for i, path in enumerate(self.paths):
+            if len(path) > max_cells:
+                raise ValueError(
+                    f"path {i} has {len(path)} steps, more than the "
+                    f"{max_cells} cells of the {self.width}x{self.height} "
+                    f"x{len(LAYERS)} board"
+                )
+        return self
+
+
+class Violation(BaseModel):
+    # one of: endpoint, out_of_bounds, illegal_layer, blocked,
+    # duplicate_cell, non_orthogonal_move, layer_change_moved,
+    # via_limit_exceeded, net_overlap, net_adjacent
+    rule: str
+    # indices (into the request net list) of every net involved
+    nets: list[int]
+    # step indices of every involved step (empty for an empty path's
+    # endpoint violation), flattened and sorted across involved nets
+    steps: list[int]
+    # coordinates of every involved cell, sorted; empty for an empty
+    # path's endpoint violation
+    cells: list[PathCell]
+
+
+class InspectResponse(BaseModel):
+    legal: bool
+    violations: list[Violation]
