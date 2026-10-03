@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from .schemas import RouteRequest, RouteResponse
+from .inspector import inspect_board
+from .schemas import InspectRequest, InspectResponse, RouteRequest, RouteResponse
 from .solver import solve_board
 
 app = FastAPI(
@@ -27,3 +28,9 @@ def route(req: RouteRequest) -> RouteResponse:
     # `def` (not `async def`): the CP-SAT solve is CPU-bound, so FastAPI
     # runs it in the threadpool and the event loop stays responsive.
     return solve_board(req)
+
+
+@app.post("/inspect", response_model=InspectResponse)
+def inspect(req: InspectRequest) -> InspectResponse:
+    # pure rule audit of the supplied candidate paths; no solving
+    return inspect_board(req)

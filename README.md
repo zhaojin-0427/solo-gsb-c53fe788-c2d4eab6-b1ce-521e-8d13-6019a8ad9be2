@@ -14,7 +14,8 @@ docker compose up --build
 
 服务监听 `http://localhost:8000`：
 
-- `POST /route` — 布线接口
+- `POST /route` — 布线接口（CP-SAT 联合求解）
+- `POST /inspect` — 走线审查接口（只校验给定候选路径，不重新求解）
 - `GET  /health` — 健康检查
 - `GET  /docs` — Swagger UI 交互文档
 
@@ -204,6 +205,205 @@ curl -s -X POST http://localhost:8000/route \
 #   "msg":"Value error, net 0 pad (1, 1, layer 0) is on a blocked cell", ...}]}
 ```
 
+## POST /inspect
+
+走线审查接口。请求体与 `/route` 的板定义完全相同（`width`、`height`、
+`blocked`、`nets`，并经过同样的板面校验），另外要求一个 **`paths`** 字段：
+按 `nets` 的网序排列，每条网络给出一条**有序候选路径**（从首焊盘到末焊盘
+的占格序列，编号规则与 `/route` 返回的 `path` 一致）。
+
+接口**不会重新求解**，只静态检查给定路径，并报告**全部**走线违规：一条网
+出错不会中断对其他规则和其他网络的检查。越界坐标和非法层号属于**走线违规**
+（仍返回 `200`），而不是请求格式错误；只有请求本身畸形时才返回 `422`。
+
+### 审查的规则
+
+| 规则码 | 含义 |
+| --- | --- |
+| `ENDPOINT_MISMATCH` | 路径首格不是 `pads[0]`，或末格不是 `pads[1]`（空路径两个端点都报） |
+| `CELL_OUT_OF_BOUNDS` | 步格坐标超出板面（`x`/`y`） |
+| `ILLEGAL_LAYER` | 步格 `layer` 不是 `0`/`1` |
+| `BLOCKED_CELL` | 步格落在禁布格上 |
+| `DUPLICATE_CELL` | 同一网重复占据同一个 `(x, y, layer)` |
+| `NON_ORTHOGONAL_STEP` | 同层相邻两步不是正交单位步（对角、跳跃、原地） |
+| `LAYER_CHANGE_OFFSET` | 相邻两步换了层但坐标不同（非原位换层） |
+| `VIA_LIMIT` | 过孔数（同坐标两层均被占用即计一个过孔）超过 `via_limit` |
+| `CROSS_NET_COINCIDE` | 两条不同网络在同层占据同一格 |
+| `CROSS_NET_ADJACENT` | 两条不同网络在同层占据正交相邻格 |
+
+细则：
+
+- **过孔计数**：某坐标的第 0、1 两层都被同一网占用即计 1 个过孔（无论两层
+  在路径中是否相邻）；过孔按同坐标占两层计数。
+- **跨网比较范围**：只比较**板内合法层**的占格；越界格、非法层格不参与跨网
+  比较；**禁布格仍然参与**（禁布格上的异网重合/相邻照报）。
+- **三网同格**：同一格被三条网占据时报 `0-1`、`0-2`、`1-2` **三对**冲突。
+- **镜像去重**：同一条无向边/同一对网只报一条；但不同网对分别保留，同一网
+  重复访问该格的**全部步号**都保留。
+- 步号（`steps`）从 **0** 开始，即路径数组下标。
+
+### 响应体
+
+| 字段 | 说明 |
+| --- | --- |
+| `legal` | 仅当没有任何违规时为 `true` |
+| `violations` | 违规列表，按「网序 → 步号 → 规则码」排序 |
+| `violations[].rule` | 上表中的规则码 |
+| `violations[].nets` | 涉及网络的下标（网序）：单网规则为 `[i]`，跨网规则为 `[i, j]`（`i < j`） |
+| `violations[].steps` | 与 `nets` 平行：每个网参与该违规的步号列表（已排序；空路径的端点违规为 `[]`） |
+| `violations[].cells` | 涉及格：跨网规则按网序给出，其余按规范序；格为 `{"x", "y", "layer"}`（可以是越界/非法层值） |
+| `violations[].via_count` / `via_limit` | 仅 `VIA_LIMIT` 违规出现：实际过孔数 / 上限 |
+
+### 实际请求与响应示例
+
+合法候选路径（与 `/route` 可能返回的路径格式完全相同）：
+
+```bash
+curl -s -X POST http://localhost:8000/inspect \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "width": 3,
+  "height": 3,
+  "nets": [
+    {"name": "N1", "pads": [{"x": 0, "y": 0, "layer": 0}, {"x": 2, "y": 2, "layer": 0}], "via_limit": 2}
+  ],
+  "paths": [
+    [
+      {"x": 0, "y": 0, "layer": 0},
+      {"x": 1, "y": 0, "layer": 0},
+      {"x": 1, "y": 0, "layer": 1},
+      {"x": 1, "y": 1, "layer": 1},
+      {"x": 1, "y": 2, "layer": 1},
+      {"x": 1, "y": 2, "layer": 0},
+      {"x": 2, "y": 2, "layer": 0}
+    ]
+  ]
+}'
+```
+
+```json
+{"legal": true, "violations": []}
+```
+
+含多种违规的例子（4×3 板，第 0 层 `(2,1)` 禁布；N1 直行合法，N2 斜跳、
+踩禁布格并与 N1 正交相邻）：
+
+```bash
+curl -s -X POST http://localhost:8000/inspect \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "width": 4,
+  "height": 3,
+  "blocked": [{"x": 2, "y": 1, "layer": 0}],
+  "nets": [
+    {"name": "N1", "pads": [{"x": 0, "y": 0, "layer": 0}, {"x": 3, "y": 0, "layer": 0}], "via_limit": 0},
+    {"name": "N2", "pads": [{"x": 0, "y": 2, "layer": 0}, {"x": 3, "y": 2, "layer": 0}], "via_limit": 0}
+  ],
+  "paths": [
+    [
+      {"x": 0, "y": 0, "layer": 0},
+      {"x": 1, "y": 0, "layer": 0},
+      {"x": 2, "y": 0, "layer": 0},
+      {"x": 3, "y": 0, "layer": 0}
+    ],
+    [
+      {"x": 0, "y": 2, "layer": 0},
+      {"x": 1, "y": 1, "layer": 0},
+      {"x": 2, "y": 1, "layer": 0},
+      {"x": 3, "y": 2, "layer": 0}
+    ]
+  ]
+}'
+```
+
+实际响应（已按网序、步号、规则码排序；跨网违规排在 N2 自身违规之前）：
+
+```json
+{
+  "legal": false,
+  "violations": [
+    {
+      "rule": "CROSS_NET_ADJACENT",
+      "nets": [0, 1],
+      "steps": [[1], [1]],
+      "cells": [
+        {"x": 1, "y": 0, "layer": 0},
+        {"x": 1, "y": 1, "layer": 0}
+      ],
+      "via_count": null,
+      "via_limit": null
+    },
+    {
+      "rule": "CROSS_NET_ADJACENT",
+      "nets": [0, 1],
+      "steps": [[2], [2]],
+      "cells": [
+        {"x": 2, "y": 0, "layer": 0},
+        {"x": 2, "y": 1, "layer": 0}
+      ],
+      "via_count": null,
+      "via_limit": null
+    },
+    {
+      "rule": "NON_ORTHOGONAL_STEP",
+      "nets": [1],
+      "steps": [[0, 1]],
+      "cells": [
+        {"x": 0, "y": 2, "layer": 0},
+        {"x": 1, "y": 1, "layer": 0}
+      ],
+      "via_count": null,
+      "via_limit": null
+    },
+    {
+      "rule": "BLOCKED_CELL",
+      "nets": [1],
+      "steps": [[2]],
+      "cells": [{"x": 2, "y": 1, "layer": 0}],
+      "via_count": null,
+      "via_limit": null
+    },
+    {
+      "rule": "NON_ORTHOGONAL_STEP",
+      "nets": [1],
+      "steps": [[2, 3]],
+      "cells": [
+        {"x": 2, "y": 1, "layer": 0},
+        {"x": 3, "y": 2, "layer": 0}
+      ],
+      "via_count": null,
+      "via_limit": null
+    }
+  ]
+}
+```
+
+### 输入校验（HTTP 422）
+
+除继承 `/route` 的全部板面校验（尺寸、网络数、焊盘越界/落禁布格/重复等）
+外，`/inspect` 另有以下 422 情形：
+
+- 缺少 `paths` 字段；
+- `paths` 条数与 `nets` 不一致；
+- 路径坐标不是整数（`0.5`、`1.0`、`"1"`、`true`、`null` 均拒绝）；
+- 单条路径步数超过两层板格总数 `2 × width × height`
+  （空路径合法，报端点违规；长度恰好等于上限的路径可以提交审查）。
+
+示例（坐标使用了小数）：
+
+```bash
+curl -s -X POST http://localhost:8000/inspect \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "width": 3, "height": 3,
+  "nets": [{"pads": [{"x": 0, "y": 0, "layer": 0}, {"x": 2, "y": 2, "layer": 0}], "via_limit": 0}],
+  "paths": [[{"x": 0, "y": 0, "layer": 0.5}, {"x": 2, "y": 2, "layer": 0}]]
+}'
+# HTTP 422
+# {"detail":[{"type":"int_type","loc":["body","paths",0,0,"layer"],
+#   "msg":"Input should be a valid integer","input":0.5}]}
+```
+
 ## 实现要点
 
 - **模型**（`app/solver.py`）：每条网络建模为从 `pads[0]` 到 `pads[1]` 的
@@ -223,16 +423,26 @@ curl -s -X POST http://localhost:8000/route \
 - **解校验**：`tests/test_router.py` 内含独立校验器，对返回的每条路径
   检查端点、占格不重复、同层正交移动、过孔占两层、禁布格、过孔上限、
   异网隔离及目标值一致性。
+- **走线审查**（`app/inspector.py`）：`POST /inspect` 不求解，只逐条规则
+  审计候选路径。单网规则（端点、越界、非法层、禁布、重复、非正交跳步、
+  非原位换层、过孔上限）逐网检查；跨网规则只对板内合法层占格建占格表，
+  同格报 `CROSS_NET_COINCIDE`（每对网一条，三网同格报三对），正交邻边
+  报 `CROSS_NET_ADJACENT`（每条无向边只枚举一次，镜像冲突去重；不同网对
+  和重复访问的全部步号保留）。越界与非法层以 `200` 返回违规；请求畸形
+  （缺字段、路径数不符、非整数坐标、单路径超过 `2wh` 格）由 Pydantic
+  返回 `422`。`tests/test_inspect.py` 覆盖全部规则、排序语义与 422。
 
 ## 项目结构
 
 ```
 app/
-  main.py      # FastAPI 入口，POST /route、GET /health
-  schemas.py   # Pydantic 请求/响应模型与 422 校验
-  solver.py    # CP-SAT 联合建模、启发式 hint、结果提取
+  main.py       # FastAPI 入口，POST /route、POST /inspect、GET /health
+  schemas.py    # Pydantic 请求/响应模型与 422 校验
+  solver.py     # CP-SAT 联合建模、启发式 hint、结果提取
+  inspector.py  # /inspect 走线规则静态审查（不求解）
 tests/
   test_router.py
+  test_inspect.py
 Dockerfile
 docker-compose.yml
 requirements.txt
